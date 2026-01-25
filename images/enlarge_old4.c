@@ -27,10 +27,9 @@ unsigned char *gray(struct imgRawImage *image)
     unsigned int height = image->height;
     unsigned char *lpData = image->lpData;
     unsigned char *output = malloc(sizeof(unsigned char) * 3 * width * height);
+    unsigned int size = width * height * 3;
 
-#pragma omp target teams distribute parallel for collapse(2) \
-    map(to : lpData[0 : width * height * 3])                 \
-    map(from : output[0 : width * height * 3])
+#pragma omp target teams distribute parallel for map(to : lpData[0 : size]) map(from : output[0 : size])
     for (int y = 0; y < height; ++y)
     {
         for (int x = 0; x < width; ++x)
@@ -48,16 +47,16 @@ unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height)
 {
     unsigned int *output = malloc(sizeof(unsigned int) * width * height);
 
-#pragma omp target data map(to : data[0 : width * height]) map(from : output[0 : width * height])
+#pragma omp target data map(to : data[0 : width * height]) map(tofrom : output[0 : width * height])
     {
-// First row: copy directly
+// First row - parallel copy
 #pragma omp target teams distribute parallel for
         for (int x = 0; x < width; ++x)
         {
             o(0, x) = d1(0, x);
         }
 
-        // Subsequent rows: each row depends on the previous row
+        // Remaining rows - row by row with parallel inner loop
         for (int y = 1; y < height; ++y)
         {
 #pragma omp target teams distribute parallel for
@@ -108,14 +107,15 @@ void selectionSort(unsigned int arr[], int n)
 
 unsigned int *calculateEnergySobel(struct imgRawImage *image)
 {
+    // TODO implement Torus
     unsigned int width = image->width;
     unsigned int height = image->height;
     unsigned char *lpData = image->lpData;
     unsigned int *output = malloc(sizeof(unsigned int) * height * width);
+    unsigned int size = width * height * 3;
 
 #pragma omp target teams distribute parallel for collapse(2) \
-    map(to : lpData[0 : width * height * 3])                 \
-    map(from : output[0 : width * height])
+    map(to : lpData[0 : size]) map(from : output[0 : width * height])
     for (int y = 0; y < height; ++y)
     {
         for (int x = 0; x < width; ++x)
@@ -169,12 +169,12 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
                 bins[i] /= 81.0; // Normalize the counter to turn it into a probability
                 if (bins[i] > 0.0)
                 {
-                    e_entropy += (int)(-1.0 * log2(bins[i]) * bins[i] * (CHAR_MAX / 5.0 * 3.2));
+                    e_entropy += (int)entrop(bins[i]);
                 }
             }
 
             // Step 3: assign energy value
-            o(y, x) = e_1 + e_entropy;
+            output[y * width + x] = e_1 + e_entropy;
         }
     }
     return output;
@@ -192,7 +192,7 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
     free(pixelEnergies);
 
     // find seams by looking at the bottom row
-    unsigned int *mins = malloc(sizeof(unsigned int) * seams);
+    unsigned int mins[seams];
     int width = image->width;
 
     for (int k = 0; k < seams; ++k)
@@ -236,14 +236,15 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
         // each iteration increases the width by 1
         int width = image->width;
         unsigned char *oldData = image->lpData;
+        // printf("iteration %i with width=%i and minIdx=%d\n", i, width, minIdx);
         newMinEnergySums = malloc(sizeof(unsigned int) * (width + 1) * height);
         newData = malloc(sizeof(unsigned char) * 3 * (width + 1) * height);
 
-        // Berechne den Seam-Pfad zuerst
+        // Pre-compute the seam path (x positions for each row)
         int *seamPath = malloc(sizeof(int) * height);
         seamPath[height - 1] = minIdx;
-        int x = minIdx;
 
+        int x = minIdx;
         for (int y = height - 2; y >= 0; --y)
         {
             unsigned int min;
@@ -270,13 +271,12 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
             seamPath[y] = x;
         }
 
-// Parallelisiere das Kopieren der Pixel pro Zeile
+// Now copy pixels in parallel for all rows
 #pragma omp parallel for
         for (int y = 0; y < height; ++y)
         {
             int sx = seamPath[y];
-
-            // copy the pixels on the left side of the seam
+            // copy the pixels on the left side of the seam (including seam pixel)
             for (int j = 0; j <= sx; ++j)
             {
                 nw(y, j) = m1(y, j);
@@ -284,7 +284,7 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
                 nd3(y, j, 1) = od3(y, j, 1);
                 nd3(y, j, 2) = od3(y, j, 2);
             }
-            // Dupliziere den Seam-Pixel
+            // duplicate the seam pixel
             nw(y, sx + 1) = m1(y, sx);
             nd3(y, sx + 1, 0) = od3(y, sx, 0);
             nd3(y, sx + 1, 1) = od3(y, sx, 1);
@@ -306,9 +306,6 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
         free(minEnergySums);
         minEnergySums = newMinEnergySums;
     }
-
-    free(mins);
-    free(minEnergySums);
     return image;
 }
 
