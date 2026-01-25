@@ -17,6 +17,10 @@
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
+// Makro für gepaddetes Bild (Padding = 4)
+#define PAD 4
+#define pd3(y, x, z) paddedData[((y) + PAD) * paddedWidth * 3 + ((x) + PAD) * 3 + (z)]
+
 // Note: Since the gradient isn't normalized,
 // we rescale the summands in the entropy calculations slightly,
 #define entrop(p) (-1.0 * log2((p)) * (p) * (CHAR_MAX / 5.0 * 3.2))
@@ -27,8 +31,10 @@ unsigned char *gray(struct imgRawImage *image)
     unsigned int height = image->height;
     unsigned char *lpData = image->lpData;
     unsigned char *output = malloc(sizeof(unsigned char) * 3 * width * height);
+    long size = (long)width * height * 3;
 
-#pragma omp parallel for collapse(2)
+    #pragma omp target teams distribute parallel for collapse(2) \
+        map(to: lpData[0:size]) map(from: output[0:size])
     for (int y = 0; y < height; ++y)
     {
         for (int x = 0; x < width; ++x)
@@ -45,31 +51,35 @@ unsigned char *gray(struct imgRawImage *image)
 unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height)
 {
     unsigned int *output = malloc(sizeof(unsigned int) * width * height);
+    long size = (long)width * height;
 
-    // Erste Zeile kopieren
-    for (int x = 0; x < width; ++x)
+    #pragma omp target data map(to: data[0:size]) map(tofrom: output[0:size])
     {
-        o(0, x) = d1(0, x);
-    }
-
-    // Dynamische Programmierung - zeilenweise mit Abhängigkeit
-    // Jede Zeile kann parallel berechnet werden, aber Zeilen müssen sequentiell sein
-    for (int y = 1; y < height; ++y)
-    {
-#pragma omp parallel for
+        // Erste Zeile kopieren
+        #pragma omp target teams distribute parallel for
         for (int x = 0; x < width; ++x)
         {
-            if (x == width - 1)
-            { // rightmost pixel of a row
-                o(y, x) = d1(y, x) + MIN(o(y - 1, x - 1), o(y - 1, x));
-            }
-            else if (x == 0)
-            { // leftmost pixel of a row
-                o(y, x) = d1(y, x) + MIN(o(y - 1, x), o(y - 1, x + 1));
-            }
-            else
+            o(0, x) = d1(0, x);
+        }
+
+        // Dynamische Programmierung - zeilenweise mit Abhängigkeit
+        for (int y = 1; y < height; ++y)
+        {
+            #pragma omp target teams distribute parallel for
+            for (int x = 0; x < width; ++x)
             {
-                o(y, x) = d1(y, x) + MIN(MIN(o(y - 1, x - 1), o(y - 1, x)), o(y - 1, x + 1));
+                if (x == width - 1)
+                { // rightmost pixel of a row
+                    o(y, x) = d1(y, x) + MIN(o(y - 1, x - 1), o(y - 1, x));
+                }
+                else if (x == 0)
+                { // leftmost pixel of a row
+                    o(y, x) = d1(y, x) + MIN(o(y - 1, x), o(y - 1, x + 1));
+                }
+                else
+                {
+                    o(y, x) = d1(y, x) + MIN(MIN(o(y - 1, x - 1), o(y - 1, x)), o(y - 1, x + 1));
+                }
             }
         }
     }
@@ -107,10 +117,42 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
     unsigned int height = image->height;
     unsigned char *lpData = image->lpData;
     unsigned int *output = malloc(sizeof(unsigned int) * height * width);
+    
+    // Erstelle gepaddetes Bild für korrekte Randzugriffe (wie im Original)
+    int paddedWidth = width + 2 * PAD;
+    int paddedHeight = height + 2 * PAD;
+    unsigned char *paddedData = malloc(sizeof(unsigned char) * 3 * paddedWidth * paddedHeight);
+    
+    // Kopiere Originalbild in die Mitte des gepaddeten Bildes
+    // und fülle Ränder mit 0 (wie uninitialisierter Speicher im Original)
+    for (int y = 0; y < paddedHeight; ++y)
+    {
+        for (int x = 0; x < paddedWidth; ++x)
+        {
+            int srcY = y - PAD;
+            int srcX = x - PAD;
+            if (srcY >= 0 && srcY < height && srcX >= 0 && srcX < width)
+            {
+                paddedData[y * paddedWidth * 3 + x * 3 + 0] = lpData[srcY * width * 3 + srcX * 3 + 0];
+                paddedData[y * paddedWidth * 3 + x * 3 + 1] = lpData[srcY * width * 3 + srcX * 3 + 1];
+                paddedData[y * paddedWidth * 3 + x * 3 + 2] = lpData[srcY * width * 3 + srcX * 3 + 2];
+            }
+            else
+            {
+                // Außerhalb: mit 0 füllen (simuliert undefinierten Speicher)
+                paddedData[y * paddedWidth * 3 + x * 3 + 0] = 0;
+                paddedData[y * paddedWidth * 3 + x * 3 + 1] = 0;
+                paddedData[y * paddedWidth * 3 + x * 3 + 2] = 0;
+            }
+        }
+    }
 
-// Berechnung auf Host für identische Ergebnisse mit dem sequentiellen Programm
-// (Das Original hat undefiniertes Verhalten bei Randzugriffen)
-#pragma omp parallel for collapse(2)
+    long paddedSize = (long)paddedWidth * paddedHeight * 3;
+    long outSize = (long)width * height;
+
+    #pragma omp target teams distribute parallel for collapse(2) \
+        map(to: paddedData[0:paddedSize], width, height, paddedWidth) \
+        map(from: output[0:outSize])
     for (int y = 0; y < height; ++y)
     {
         for (int x = 0; x < width; ++x)
@@ -120,12 +162,15 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
 
             // Step 1: Compute edge-component
             // apply Sobel operator in X direction
-            gx = -1 * d3(y - 1, x - 1, 0) + 1 * d3(y - 1, x + 1, 0) - 2 * d3(y, x - 1, 0) + 2 * d3(y, x + 1, 0) - 1 * d3(y + 1, x - 1, 0) + 1 * d3(y + 1, x + 1, 0);
+            gx = -1 * pd3(y - 1, x - 1, 0) + 1 * pd3(y - 1, x + 1, 0) 
+               - 2 * pd3(y, x - 1, 0) + 2 * pd3(y, x + 1, 0) 
+               - 1 * pd3(y + 1, x - 1, 0) + 1 * pd3(y + 1, x + 1, 0);
 
             // apply Sobel operator in Y direction
-            gy = -1 * d3(y - 1, x - 1, 0) - 2 * d3(y - 1, x, 0) - 1 * d3(y - 1, x + 1, 0) + 1 * d3(y + 1, x - 1, 0) + 2 * d3(y + 1, x, 0) + 1 * d3(y + 1, x + 1, 0);
+            gy = -1 * pd3(y - 1, x - 1, 0) - 2 * pd3(y - 1, x, 0) - 1 * pd3(y - 1, x + 1, 0) 
+               + 1 * pd3(y + 1, x - 1, 0) + 2 * pd3(y + 1, x, 0) + 1 * pd3(y + 1, x + 1, 0);
 
-            e_1 = (int)(abs(gx) + abs(gy));
+            e_1 = (gx >= 0 ? gx : -gx) + (gy >= 0 ? gy : -gy);
 
             // Step 2: Compute entropy-component
             // clear out bins and reset variables
@@ -142,8 +187,9 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
             {
                 for (int u = -4; u < 4; ++u)
                 {
-                    local_min = MIN(local_min, d3(y + v, x + u, 0));
-                    local_max = MAX(local_max, d3(y + v, x + u, 0));
+                    int val = pd3(y + v, x + u, 0);
+                    local_min = MIN(local_min, val);
+                    local_max = MAX(local_max, val);
                 }
             }
             hist_width = local_max - local_min + 1;
@@ -153,7 +199,7 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
             {
                 for (int u = -4; u < 4; ++u)
                 {
-                    int i = (d3(y + v, x + u, 0) - local_min) * 9 / hist_width;
+                    int i = (pd3(y + v, x + u, 0) - local_min) * 9 / hist_width;
                     bins[i] += 1.0;
                 }
             }
@@ -172,6 +218,8 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
             o(y, x) = e_1 + e_entropy;
         }
     }
+    
+    free(paddedData);
     return output;
 }
 
