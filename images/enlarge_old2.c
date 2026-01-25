@@ -3,7 +3,7 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
-#include <string.h>
+#include <omp.h>
 #include "image.h"
 
 // Define macros for host/device code compatibility
@@ -24,11 +24,12 @@ unsigned char *gray(struct imgRawImage *image)
     unsigned int height = image->height;
     unsigned int size = 3 * width * height;
 
-    // Allocate output
-    unsigned char *output = (unsigned char *)malloc(size * sizeof(unsigned char));
+    // Allocate output on device
+    unsigned char *output = (unsigned char *)omp_target_alloc(size * sizeof(unsigned char), omp_get_default_device());
 
     unsigned char *inputData = image->lpData;
 
+#pragma omp target teams distribute parallel for is_device_ptr(output) map(to : inputData[0 : size])
     for (int y = 0; y < height; ++y)
     {
         for (int x = 0; x < width; ++x)
@@ -44,9 +45,10 @@ unsigned char *gray(struct imgRawImage *image)
 
 unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height)
 {
-    unsigned int *output = (unsigned int *)malloc(sizeof(unsigned int) * width * height);
+    unsigned int *output = (unsigned int *)omp_target_alloc(sizeof(unsigned int) * width * height, omp_get_default_device());
 
-    // row 0
+// row 0
+#pragma omp target teams distribute parallel for is_device_ptr(output, data)
     for (int x = 0; x < width; ++x)
     {
         output[x] = data[x]; // d1(0, x)
@@ -55,6 +57,7 @@ unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height)
     // Wavefront
     for (int y = 1; y < height; ++y)
     {
+#pragma omp target teams distribute parallel for is_device_ptr(output, data)
         for (int x = 0; x < width; ++x)
         {
             unsigned int val = data[y * width + x];
@@ -108,10 +111,11 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
 {
     unsigned int width = image->width;
     unsigned int height = image->height;
-    unsigned int *output = (unsigned int *)malloc(sizeof(unsigned int) * height * width);
+    unsigned int *output = (unsigned int *)omp_target_alloc(sizeof(unsigned int) * height * width, omp_get_default_device());
 
-    unsigned char *lpData = image->lpData;
+    unsigned char *lpData = image->lpData; // This is a Device Pointer now
 
+#pragma omp target teams distribute parallel for collapse(2) is_device_ptr(output, lpData)
     for (int y = 0; y < height; ++y)
     {
         for (int x = 0; x < width; ++x)
@@ -191,17 +195,17 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
     int height = image->height;
     int width = image->width; // initial width
 
-    // image->lpData is already pointer from gray()
+    // image->lpData is already Device pointer from gray()
 
     // Calculate Energies
     unsigned int *pixelEnergies = calculateEnergySobel(image);
     unsigned int *minEnergySums = calculateMinEnergySums(pixelEnergies, width, height);
-    free(pixelEnergies);
+    omp_target_free(pixelEnergies, omp_get_default_device());
 
     // START calculate MINS on HOST
-    // We need the last row of minEnergySums to find seams
+    // We need the last row of minEnergySums on Host to find seams
     unsigned int *hostLastRow = (unsigned int *)malloc(sizeof(unsigned int) * width);
-    memcpy(hostLastRow, minEnergySums + (height - 1) * width, sizeof(unsigned int) * width);
+    omp_target_memcpy(hostLastRow, minEnergySums + (height - 1) * width, sizeof(unsigned int) * width, 0, 0, omp_get_initial_device(), omp_get_default_device());
 
     unsigned int *mins = (unsigned int *)malloc(sizeof(unsigned int) * seams);
     // Copy the implementation of 'm1(height-1, j)' access using hostLastRow
@@ -241,19 +245,20 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
     free(hostLastRow);
     // END calculate MINS
 
-    // Path buffer
-    int *d_path = (int *)malloc(sizeof(int) * height);
+    // Path buffer on device
+    int *d_path = (int *)omp_target_alloc(sizeof(int) * height, omp_get_default_device());
 
     for (int i = 0; i < seams; ++i)
     {
         unsigned int minIdx = mins[i];
         int current_width = image->width;
 
-        unsigned int *newMinEnergySums = (unsigned int *)malloc(sizeof(unsigned int) * (current_width + 1) * height);
-        unsigned char *newData = (unsigned char *)malloc(sizeof(unsigned char) * 3 * (current_width + 1) * height);
+        unsigned int *newMinEnergySums = (unsigned int *)omp_target_alloc(sizeof(unsigned int) * (current_width + 1) * height, omp_get_default_device());
+        unsigned char *newData = (unsigned char *)omp_target_alloc(sizeof(unsigned char) * 3 * (current_width + 1) * height, omp_get_default_device());
         unsigned char *oldData = image->lpData;
 
-        // Kernel 1: Trace seam (Serial)
+// Kernel 1: Trace seam (Serial on GPU)
+#pragma omp target is_device_ptr(minEnergySums, d_path)
         {
             // Trace from bottom to top
             int x = minIdx;
@@ -300,7 +305,8 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
             }
         }
 
-        // Kernel 2: Copy and Enlarge (Parallel)
+// Kernel 2: Copy and Enlarge (Parallel)
+#pragma omp target teams distribute parallel for collapse(2) is_device_ptr(oldData, minEnergySums, newData, newMinEnergySums, d_path)
         for (int y = 0; y < height; ++y)
         {
             for (int j = 0; j <= current_width; ++j)
@@ -340,17 +346,25 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
         }
 
         // Free old
-        free(oldData);
-        free(minEnergySums);
+        omp_target_free(oldData, omp_get_default_device());
+        omp_target_free(minEnergySums, omp_get_default_device());
 
-        image->lpData = newData; // Update wrapper
+        image->lpData = newData; // Update wrapper (still device ptr)
         image->width = current_width + 1;
         minEnergySums = newMinEnergySums;
     }
 
-    free(d_path);
-    free(minEnergySums);
+    omp_target_free(d_path, omp_get_default_device());
+    omp_target_free(minEnergySums, omp_get_default_device());
     free(mins);
+
+    // Final Copy Back to Host
+    unsigned int final_size = image->width * image->height * 3;
+    unsigned char *hostData = (unsigned char *)malloc(final_size);
+    omp_target_memcpy(hostData, image->lpData, final_size, 0, 0, omp_get_initial_device(), omp_get_default_device());
+    omp_target_free(image->lpData, omp_get_default_device());
+
+    image->lpData = hostData;
 
     return image;
 }
