@@ -94,6 +94,7 @@ void selectionSort(unsigned int arr[], int n)
 
 unsigned int *calculateEnergySobel(struct imgRawImage *image)
 {
+    // TODO implement Torus
     unsigned int width = image->width;
     unsigned int *output = malloc(sizeof(unsigned int) * image->height * image->width);
 

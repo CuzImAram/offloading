@@ -17,6 +17,10 @@
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
+// Makro für gepaddetes Bild (Padding = 4)
+#define PAD 4
+#define pd3(y, x, z) paddedData[((y) + PAD) * paddedWidth * 3 + ((x) + PAD) * 3 + (z)]
+
 // Note: Since the gradient isn't normalized,
 // we rescale the summands in the entropy calculations slightly,
 #define entrop(p) (-1.0 * log2((p)) * (p) * (CHAR_MAX / 5.0 * 3.2))
@@ -27,9 +31,10 @@ unsigned char *gray(struct imgRawImage *image)
     unsigned int height = image->height;
     unsigned char *lpData = image->lpData;
     unsigned char *output = malloc(sizeof(unsigned char) * 3 * width * height);
-    unsigned int size = width * height * 3;
+    long size = (long)width * height * 3;
 
-#pragma omp target teams distribute parallel for map(to : lpData[0 : size]) map(from : output[0 : size])
+#pragma omp target teams distribute parallel for collapse(2) \
+    map(to : lpData[0 : size]) map(from : output[0 : size])
     for (int y = 0; y < height; ++y)
     {
         for (int x = 0; x < width; ++x)
@@ -46,17 +51,18 @@ unsigned char *gray(struct imgRawImage *image)
 unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height)
 {
     unsigned int *output = malloc(sizeof(unsigned int) * width * height);
+    long size = (long)width * height;
 
-#pragma omp target data map(to : data[0 : width * height]) map(tofrom : output[0 : width * height])
+#pragma omp target data map(to : data[0 : size]) map(tofrom : output[0 : size])
     {
-// First row - parallel copy
+// Erste Zeile kopieren
 #pragma omp target teams distribute parallel for
         for (int x = 0; x < width; ++x)
         {
             o(0, x) = d1(0, x);
         }
 
-        // Remaining rows - row by row with parallel inner loop
+        // Dynamische Programmierung - zeilenweise mit Abhängigkeit
         for (int y = 1; y < height; ++y)
         {
 #pragma omp target teams distribute parallel for
@@ -107,15 +113,46 @@ void selectionSort(unsigned int arr[], int n)
 
 unsigned int *calculateEnergySobel(struct imgRawImage *image)
 {
-    // TODO implement Torus
     unsigned int width = image->width;
     unsigned int height = image->height;
     unsigned char *lpData = image->lpData;
     unsigned int *output = malloc(sizeof(unsigned int) * height * width);
-    unsigned int size = width * height * 3;
 
-#pragma omp target teams distribute parallel for collapse(2) \
-    map(to : lpData[0 : size]) map(from : output[0 : width * height])
+    // Erstelle gepaddetes Bild für korrekte Randzugriffe (wie im Original)
+    int paddedWidth = width + 2 * PAD;
+    int paddedHeight = height + 2 * PAD;
+    unsigned char *paddedData = malloc(sizeof(unsigned char) * 3 * paddedWidth * paddedHeight);
+
+    // Kopiere Originalbild in die Mitte des gepaddeten Bildes
+    // und fülle Ränder mit 0 (wie uninitialisierter Speicher im Original)
+    for (int y = 0; y < paddedHeight; ++y)
+    {
+        for (int x = 0; x < paddedWidth; ++x)
+        {
+            int srcY = y - PAD;
+            int srcX = x - PAD;
+            if (srcY >= 0 && srcY < height && srcX >= 0 && srcX < width)
+            {
+                paddedData[y * paddedWidth * 3 + x * 3 + 0] = lpData[srcY * width * 3 + srcX * 3 + 0];
+                paddedData[y * paddedWidth * 3 + x * 3 + 1] = lpData[srcY * width * 3 + srcX * 3 + 1];
+                paddedData[y * paddedWidth * 3 + x * 3 + 2] = lpData[srcY * width * 3 + srcX * 3 + 2];
+            }
+            else
+            {
+                // Außerhalb: mit 0 füllen (simuliert undefinierten Speicher)
+                paddedData[y * paddedWidth * 3 + x * 3 + 0] = 0;
+                paddedData[y * paddedWidth * 3 + x * 3 + 1] = 0;
+                paddedData[y * paddedWidth * 3 + x * 3 + 2] = 0;
+            }
+        }
+    }
+
+    long paddedSize = (long)paddedWidth * paddedHeight * 3;
+    long outSize = (long)width * height;
+
+#pragma omp target teams distribute parallel for collapse(2)         \
+    map(to : paddedData[0 : paddedSize], width, height, paddedWidth) \
+    map(from : output[0 : outSize])
     for (int y = 0; y < height; ++y)
     {
         for (int x = 0; x < width; ++x)
@@ -125,12 +162,12 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
 
             // Step 1: Compute edge-component
             // apply Sobel operator in X direction
-            gx = -1 * d3(y - 1, x - 1, 0) + 1 * d3(y - 1, x + 1, 0) - 2 * d3(y, x - 1, 0) + 2 * d3(y, x + 1, 0) - 1 * d3(y + 1, x - 1, 0) + 1 * d3(y + 1, x + 1, 0);
+            gx = -1 * pd3(y - 1, x - 1, 0) + 1 * pd3(y - 1, x + 1, 0) - 2 * pd3(y, x - 1, 0) + 2 * pd3(y, x + 1, 0) - 1 * pd3(y + 1, x - 1, 0) + 1 * pd3(y + 1, x + 1, 0);
 
             // apply Sobel operator in Y direction
-            gy = -1 * d3(y - 1, x - 1, 0) - 2 * d3(y - 1, x, 0) - 1 * d3(y - 1, x + 1, 0) + 1 * d3(y + 1, x - 1, 0) + 2 * d3(y + 1, x, 0) + 1 * d3(y + 1, x + 1, 0);
+            gy = -1 * pd3(y - 1, x - 1, 0) - 2 * pd3(y - 1, x, 0) - 1 * pd3(y - 1, x + 1, 0) + 1 * pd3(y + 1, x - 1, 0) + 2 * pd3(y + 1, x, 0) + 1 * pd3(y + 1, x + 1, 0);
 
-            e_1 = (int)(abs(gx) + abs(gy));
+            e_1 = (gx >= 0 ? gx : -gx) + (gy >= 0 ? gy : -gy);
 
             // Step 2: Compute entropy-component
             // clear out bins and reset variables
@@ -147,8 +184,9 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
             {
                 for (int u = -4; u < 4; ++u)
                 {
-                    local_min = MIN(local_min, d3(y + v, x + u, 0));
-                    local_max = MAX(local_max, d3(y + v, x + u, 0));
+                    int val = pd3(y + v, x + u, 0);
+                    local_min = MIN(local_min, val);
+                    local_max = MAX(local_max, val);
                 }
             }
             hist_width = local_max - local_min + 1;
@@ -158,7 +196,7 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
             {
                 for (int u = -4; u < 4; ++u)
                 {
-                    int i = (d3(y + v, x + u, 0) - local_min) * 9 / hist_width;
+                    int i = (pd3(y + v, x + u, 0) - local_min) * 9 / hist_width;
                     bins[i] += 1.0;
                 }
             }
@@ -174,9 +212,11 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
             }
 
             // Step 3: assign energy value
-            output[y * width + x] = e_1 + e_entropy;
+            o(y, x) = e_1 + e_entropy;
         }
     }
+
+    free(paddedData);
     return output;
 }
 
@@ -240,10 +280,26 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
         newMinEnergySums = malloc(sizeof(unsigned int) * (width + 1) * height);
         newData = malloc(sizeof(unsigned char) * 3 * (width + 1) * height);
 
-        // Pre-compute the seam path (x positions for each row)
-        int *seamPath = malloc(sizeof(int) * height);
-        seamPath[height - 1] = minIdx;
-
+        // copy the pixels on the left side of the seam
+        for (int j = 0; j <= minIdx; ++j)
+        {
+            nw(height - 1, j) = m1(height - 1, j);
+            nd3(height - 1, j, 0) = od3(height - 1, j, 0);
+            nd3(height - 1, j, 1) = od3(height - 1, j, 1);
+            nd3(height - 1, j, 2) = od3(height - 1, j, 2);
+        }
+        nw(height - 1, minIdx + 1) = m1(height - 1, minIdx);
+        nd3(height - 1, minIdx + 1, 0) = od3(height - 1, minIdx, 0);
+        nd3(height - 1, minIdx + 1, 1) = od3(height - 1, minIdx, 1);
+        nd3(height - 1, minIdx + 1, 2) = od3(height - 1, minIdx, 2);
+        // move all pixels right of the seam 1 to the right
+        for (int j = minIdx + 1; j < width; ++j)
+        {
+            nw(height - 1, j + 1) = m1(height - 1, j);
+            nd3(height - 1, j + 1, 0) = od3(height - 1, j, 0);
+            nd3(height - 1, j + 1, 1) = od3(height - 1, j, 1);
+            nd3(height - 1, j + 1, 2) = od3(height - 1, j, 2);
+        }
         int x = minIdx;
         for (int y = height - 2; y >= 0; --y)
         {
@@ -268,29 +324,18 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
             {
                 x = x + 1;
             }
-            seamPath[y] = x;
-        }
-
-// Now copy pixels in parallel for all rows
-#pragma omp parallel for
-        for (int y = 0; y < height; ++y)
-        {
-            int sx = seamPath[y];
-            // copy the pixels on the left side of the seam (including seam pixel)
-            for (int j = 0; j <= sx; ++j)
+            for (int j = 0; j <= x; ++j)
             {
                 nw(y, j) = m1(y, j);
                 nd3(y, j, 0) = od3(y, j, 0);
                 nd3(y, j, 1) = od3(y, j, 1);
                 nd3(y, j, 2) = od3(y, j, 2);
             }
-            // duplicate the seam pixel
-            nw(y, sx + 1) = m1(y, sx);
-            nd3(y, sx + 1, 0) = od3(y, sx, 0);
-            nd3(y, sx + 1, 1) = od3(y, sx, 1);
-            nd3(y, sx + 1, 2) = od3(y, sx, 2);
-            // move all pixels right of the seam 1 to the right
-            for (int j = sx + 1; j < width; ++j)
+            nw(y, x + 1) = m1(y, x);
+            nd3(y, x + 1, 0) = od3(y, x, 0);
+            nd3(y, x + 1, 1) = od3(y, x, 1);
+            nd3(y, x + 1, 2) = od3(y, x, 2);
+            for (int j = x + 1; j < width; ++j)
             {
                 nw(y, j + 1) = m1(y, j);
                 nd3(y, j + 1, 0) = od3(y, j, 0);
@@ -298,14 +343,13 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
                 nd3(y, j + 1, 2) = od3(y, j, 2);
             }
         }
-
-        free(seamPath);
         free(image->lpData);
         image->lpData = newData;
         image->width = width + 1;
         free(minEnergySums);
         minEnergySums = newMinEnergySums;
     }
+    free(minEnergySums);
     return image;
 }
 
@@ -321,13 +365,13 @@ int main(int argc, char *argv[])
     int seams = atoi(argv[3]);
 
     struct imgRawImage *input = loadJpegImageFile(inputFile);
-    clock_t start = clock();
+    double start = omp_get_wtime();
 
     input->lpData = gray(input);
     struct imgRawImage *output = increaseWidth(input, seams);
 
-    clock_t end = clock();
-    printf("Execution time: %4.2f sec\n", (double)((double)(end - start) / CLOCKS_PER_SEC));
+    double end = omp_get_wtime();
+    printf("Execution time: %4.2f sec\n", end - start);
     storeJpegImageFile(output, outputFile);
 
     return 0;
