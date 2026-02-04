@@ -1,6 +1,7 @@
 import sys
 import numpy as np
 from PIL import Image
+import os
 
 def calculate_difference(path1, path2):
     try:
@@ -28,11 +29,22 @@ def calculate_difference(path1, path2):
     # Scale to a percentage (255 is the max possible difference for 8-bit pixels)
     percentage = (mean_diff / 255.0) * 100
 
+    # Create difference image with red markers
+    pixel_diff = np.any(diff > 0, axis=2)
+    diff_image = arr1.copy().astype(np.uint8)
+    diff_image[pixel_diff] = [255, 0, 0]  # Mark different pixels in red
+    
+    # Save difference image
+    base_name = os.path.splitext(os.path.basename(path1))[0]
+    diff_path = f"{base_name}_diff.jpg"
+    Image.fromarray(diff_image).save(f"images/{diff_path}")
+
     if percentage == 0:
-        print("✅ The images are identical (0% difference).")
+        print("The images are identical (0% difference).")
     else:
-        print(f"❌ The images are different.")
-        print(f"📊 Difference Gauge: {percentage:.2f}%")
+        print(f"The images are different.")
+        print(f"Difference Gauge: {percentage:.2f}%")
+        print(f"Difference image saved to: images/{diff_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
