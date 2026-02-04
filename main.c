@@ -9,20 +9,15 @@
 #define d3(y, x, z) image->lpData[(y)*image->width*3+(x)*3+(z)]
 #define o3(y, x, z) output[(y)*width*3+(x)*3+(z)]
 #define od3(y, x, z) oldData[(y)*width*3+(x)*3+(z)]
-#define nd3(y, x, z) newData[(y)*(width+1)*3+(x)*3+(z)]
 #define m1(y, x) minEnergySums[(y)*width+(x)]
 #define d1(y, x) data[(y)*width+(x)]
 #define o(y, x) output[(y)*width+(x)]
-#define nw(y, x) newMinEnergySums[(y)*(width+1)+(x)]
 #define MIN(a, b) (((a)<(b))?(a):(b))
 #define MAX(a, b) (((a)>(b))?(a):(b))
 #define ABS(x) (((x)<0)?-(x):(x))
 
-// Note: Since the gradient isn't normalized,
-// we rescale the summands in the entropy calculations slightly,
 #define entrop(p) (-1.0 * log2((p)) * (p) * (CHAR_MAX / 5.0 * 3.2))
 
-// Torus indexing for safe boundary access
 #define TORUS_Y(y, height) (((y) + (height)) % (height))
 #define TORUS_X(x, width) (((x) + (width)) % (width))
 
@@ -33,7 +28,6 @@ unsigned char *gray(struct imgRawImage *image) {
     unsigned char *output = malloc(sizeof(unsigned char) * 3 * width * height);
     unsigned char *input = image->lpData;
 
-    // GPU offloading for gray conversion - fully parallel
     #pragma omp target teams distribute parallel for collapse(2) \
     map(to: input[0:width*height*3]) \
     map(from: output[0:width*height*3])
@@ -55,7 +49,6 @@ unsigned char *gray(struct imgRawImage *image) {
 unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height) {
     unsigned int *output = malloc(sizeof(unsigned int) * width * height);
 
-    // First row initialization - parallel
     #pragma omp target teams distribute parallel for \
     map(to: data[0:width*height]) \
     map(from: output[0:width*height])
@@ -63,8 +56,6 @@ unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height) 
         output[x] = data[x];
     }
 
-    // Subsequent rows - must be sequential in y, but parallel in x
-    // Each row depends on previous row, so we do row-by-row on GPU
     #pragma omp target data map(to: data[0:width*height]) \
     map(tofrom: output[0:width*height])
     {
@@ -75,11 +66,11 @@ unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height) 
                 int idx = y * width + x;
                 int idx_prev = (y - 1) * width + x;
 
-                if (x == width - 1) { // rightmost pixel
+                if (x == width - 1) {
                     min_val = MIN(output[idx_prev - 1], output[idx_prev]);
-                } else if (x == 0) { // leftmost pixel
+                } else if (x == 0) {
                     min_val = MIN(output[idx_prev], output[idx_prev + 1]);
-                } else { // middle pixels
+                } else {
                     min_val = MIN(MIN(output[idx_prev - 1], output[idx_prev]),
                                   output[idx_prev + 1]);
                 }
@@ -91,32 +82,12 @@ unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height) 
     return output;
 }
 
-void swap(unsigned int *xp, unsigned int *yp) {
-    int temp = *xp;
-    *xp = *yp;
-    *yp = temp;
-}
-
-void selectionSort(unsigned int arr[], int n) {
-    int i, j, max_idx;
-
-    for (i = 0; i < n - 1; i++) {
-        max_idx = i;
-        for (j = i + 1; j < n; j++)
-            if (arr[j] > arr[max_idx])
-                max_idx = j;
-        swap(&arr[max_idx], &arr[i]);
-    }
-}
-
 unsigned int *calculateEnergySobel(struct imgRawImage *image) {
     unsigned int width = image->width;
     unsigned int height = image->height;
     unsigned int *output = malloc(sizeof(unsigned int) * height * width);
     unsigned char *input = image->lpData;
 
-    // GPU offloading for energy calculation
-    // This is the most computationally intensive part
     #pragma omp target teams distribute parallel for collapse(2) \
     map(to: input[0:width*height*3]) \
     map(from: output[0:width*height])
@@ -125,8 +96,6 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image) {
             int gx, gy, e_1, local_min, local_max, hist_width, e_entropy;
             double bins[9];
 
-            // Step 1: Compute edge-component using Torus indexing
-            // apply Sobel operator in X direction
             int y_m1 = TORUS_Y(y - 1, height);
             int y_p1 = TORUS_Y(y + 1, height);
             int x_m1 = TORUS_X(x - 1, width);
@@ -139,7 +108,6 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image) {
             - 1 * input[(y_p1 * width + x_m1) * 3 + 0]
             + 1 * input[(y_p1 * width + x_p1) * 3 + 0];
 
-            // apply Sobel operator in Y direction
             gy = -1 * input[(y_m1 * width + x_m1) * 3 + 0]
             - 2 * input[(y_m1 * width + x) * 3 + 0]
             - 1 * input[(y_m1 * width + x_p1) * 3 + 0]
@@ -149,7 +117,6 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image) {
 
             e_1 = ABS(gx) + ABS(gy);
 
-            // Step 2: Compute entropy-component with Torus indexing
             for (int i = 0; i < 9; ++i) {
                 bins[i] = 0;
             }
@@ -157,7 +124,6 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image) {
             local_max = INT_MIN;
             e_entropy = 0;
 
-            // find min/max for local histogram (8x8 neighborhood)
             for (int v = -4; v < 4; ++v) {
                 for (int u = -4; u < 4; ++u) {
                     int y_idx = TORUS_Y(y + v, height);
@@ -169,7 +135,6 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image) {
             }
             hist_width = local_max - local_min + 1;
 
-            // compute local histogram
             for (int v = -4; v < 4; ++v) {
                 for (int u = -4; u < 4; ++u) {
                     int y_idx = TORUS_Y(y + v, height);
@@ -180,7 +145,6 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image) {
                 }
             }
 
-            // compute entropy
             for (int i = 0; i < 9; ++i) {
                 bins[i] /= 81.0;
                 if (bins[i] > 0.0) {
@@ -188,141 +152,209 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image) {
                 }
             }
 
-            // Step 3: assign energy value
             output[y * width + x] = e_1 + e_entropy;
         }
     }
     return output;
 }
 
-// increases the number of columns by seams
-struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams) {
-    int height = image->height;
-    unsigned int *newMinEnergySums;
-    unsigned char *newData;
+// OPTIMIZED: Find all k seams at once (deterministic)
+void findAllSeams(unsigned int *minEnergySums, int width, int height,
+                  int k, int *seamStartIndices) {
+    // Find k minimum positions in bottom row (deterministic order)
+    for (int seam_id = 0; seam_id < k; ++seam_id) {
+        int min_x = -1;
+        unsigned int min_energy = UINT_MAX;
 
-    unsigned int *pixelEnergies = calculateEnergySobel(image);
-    unsigned int *minEnergySums = calculateMinEnergySums(pixelEnergies, image->width, image->height);
-    free(pixelEnergies);
-
-    // find seams by looking at the bottom row
-    unsigned int mins[seams];
-    int width = image->width;
-
-    for (int k = 0; k < seams; ++k) {
-        mins[k] = width;
-        for (int j = 0; j < width; ++j) {
-            int skip = 0;
-            for (int l = 0; l < k; ++l) {
-                if (mins[l] == j) {
-                    skip = 1;
+        for (int x = 0; x < width; ++x) {
+            // Check if already selected
+            int already_selected = 0;
+            for (int prev = 0; prev < seam_id; ++prev) {
+                if (seamStartIndices[prev] == x) {
+                    already_selected = 1;
                     break;
                 }
             }
-            if (skip == 1) {
-                continue;
+            if (already_selected) continue;
+
+            unsigned int energy = minEnergySums[(height - 1) * width + x];
+            // Deterministic tie-breaking: prefer lower x
+            if (energy < min_energy || (energy == min_energy && (min_x == -1 || x < min_x))) {
+                min_energy = energy;
+                min_x = x;
             }
-            if (mins[k] == width || m1(height - 1, j) < m1(height - 1, mins[k])) {
-                mins[k] = j;
+        }
+
+        seamStartIndices[seam_id] = min_x;
+    }
+
+    // Sort for deterministic insertion order
+    for (int i = 0; i < k - 1; ++i) {
+        for (int j = i + 1; j < k; ++j) {
+            if (seamStartIndices[i] > seamStartIndices[j]) {
+                int temp = seamStartIndices[i];
+                seamStartIndices[i] = seamStartIndices[j];
+                seamStartIndices[j] = temp;
             }
         }
     }
+                  }
 
-    for (int k = 0; k < seams; ++k) {
-        if (mins[k] >= width) {
-            mins[k] = width - 1;
-        }
-    }
+                  // OPTIMIZED: Trace all seams in parallel on GPU
+                  void traceAllSeams(unsigned int *minEnergySums, int width, int height,
+                                     int k, int *seamStartIndices, int *seamPaths) {
+                      // seamPaths[seam_id * height + y] = x position at row y
 
-    selectionSort(mins, seams);
+                      #pragma omp target teams distribute parallel for \
+                      map(to: minEnergySums[0:width*height], seamStartIndices[0:k]) \
+                      map(from: seamPaths[0:k*height])
+                      for (int seam_id = 0; seam_id < k; ++seam_id) {
+                          int x = seamStartIndices[seam_id];
+                          seamPaths[seam_id * height + (height - 1)] = x;
 
-    // Seam insertion remains on CPU - too complex for efficient GPU parallelization
-    for (int i = 0; i < seams; ++i) {
-        unsigned int minIdx = mins[i];
-        int width = image->width;
-        unsigned char *oldData = image->lpData;
-        newMinEnergySums = malloc(sizeof(unsigned int) * (width + 1) * height);
-        newData = malloc(sizeof(unsigned char) * 3 * (width + 1) * height);
+                          // Trace upward
+                          for (int y = height - 2; y >= 0; --y) {
+                              unsigned int min_val;
+                              int next_x = x;
 
-        // copy the pixels on the left side of the seam
-        for (int j = 0; j <= minIdx; ++j) {
-            nw(height - 1, j) = m1(height - 1, j);
-            nd3(height - 1, j, 0) = od3(height - 1, j, 0);
-            nd3(height - 1, j, 1) = od3(height - 1, j, 1);
-            nd3(height - 1, j, 2) = od3(height - 1, j, 2);
-        }
-        nw(height - 1, minIdx + 1) = m1(height - 1, minIdx);
-        nd3(height - 1, minIdx + 1, 0) = od3(height - 1, minIdx, 0);
-        nd3(height - 1, minIdx + 1, 1) = od3(height - 1, minIdx, 1);
-        nd3(height - 1, minIdx + 1, 2) = od3(height - 1, minIdx, 2);
+                              if (x == 0) {
+                                  unsigned int val_0 = minEnergySums[y * width + x];
+                                  unsigned int val_1 = minEnergySums[y * width + x + 1];
+                                  min_val = MIN(val_0, val_1);
+                                  if (val_1 == min_val) next_x = x + 1;
+                              } else if (x == width - 1) {
+                                  unsigned int val_m1 = minEnergySums[y * width + x - 1];
+                                  unsigned int val_0 = minEnergySums[y * width + x];
+                                  min_val = MIN(val_m1, val_0);
+                                  if (val_m1 == min_val) next_x = x - 1;
+                              } else {
+                                  unsigned int val_m1 = minEnergySums[y * width + x - 1];
+                                  unsigned int val_0 = minEnergySums[y * width + x];
+                                  unsigned int val_p1 = minEnergySums[y * width + x + 1];
+                                  min_val = MIN(MIN(val_m1, val_0), val_p1);
 
-        for (int j = minIdx + 1; j < width; ++j) {
-            nw(height - 1, j + 1) = m1(height - 1, j);
-            nd3(height - 1, j + 1, 0) = od3(height - 1, j, 0);
-            nd3(height - 1, j + 1, 1) = od3(height - 1, j, 1);
-            nd3(height - 1, j + 1, 2) = od3(height - 1, j, 2);
-        }
+                                  // Deterministic tie-breaking: prefer left, then center, then right
+                                  if (val_m1 == min_val) next_x = x - 1;
+                                  else if (val_p1 == min_val) next_x = x + 1;
+                              }
 
-        int x = minIdx;
-        for (int y = height - 2; y >= 0; --y) {
-            unsigned int min;
-            if (x == 0) {
-                min = MIN(m1(y, x), m1(y, x + 1));
-            } else if (x == width - 1) {
-                min = MIN(m1(y, x - 1), m1(y, x));
-            } else {
-                min = MIN(m1(y, x - 1), MIN(m1(y, x), m1(y, x + 1)));
-            }
-            if (x > 0 && m1(y, x - 1) == min) {
-                x = x - 1;
-            } else if (x < width - 1 && m1(y, x + 1) == min) {
-                x = x + 1;
-            }
-            for (int j = 0; j <= x; ++j) {
-                nw(y, j) = m1(y, j);
-                nd3(y, j, 0) = od3(y, j, 0);
-                nd3(y, j, 1) = od3(y, j, 1);
-                nd3(y, j, 2) = od3(y, j, 2);
-            }
-            nw(y, x + 1) = m1(y, x);
-            nd3(y, x + 1, 0) = od3(y, x, 0);
-            nd3(y, x + 1, 1) = od3(y, x, 1);
-            nd3(y, x + 1, 2) = od3(y, x, 2);
-            for (int j = x + 1; j < width; ++j) {
-                nw(y, j + 1) = m1(y, j);
-                nd3(y, j + 1, 0) = od3(y, j, 0);
-                nd3(y, j + 1, 1) = od3(y, j, 1);
-                nd3(y, j + 1, 2) = od3(y, j, 2);
-            }
-        }
-        free(image->lpData);
-        image->lpData = newData;
-        image->width = width + 1;
-        free(minEnergySums);
-        minEnergySums = newMinEnergySums;
-    }
-    return image;
-}
+                              x = next_x;
+                              seamPaths[seam_id * height + y] = x;
+                          }
+                      }
+                                     }
+
+                                     // OPTIMIZED: Insert all seams at once (parallel per row)
+                                     struct imgRawImage *insertAllSeams(struct imgRawImage *image, int k, int *seamPaths) {
+                                         int height = image->height;
+                                         int width = image->width;
+                                         int new_width = width + k;
+
+                                         unsigned char *oldData = image->lpData;
+                                         unsigned char *newData = malloc(sizeof(unsigned char) * 3 * new_width * height);
+
+                                         // Parallel insertion: each row independently
+                                         #pragma omp target teams distribute parallel for \
+                                         map(to: oldData[0:width*height*3], seamPaths[0:k*height]) \
+                                         map(from: newData[0:new_width*height*3])
+                                         for (int y = 0; y < height; ++y) {
+                                             // Collect seam positions for this row (sorted)
+                                             int seam_positions[k];
+                                             for (int s = 0; s < k; ++s) {
+                                                 seam_positions[s] = seamPaths[s * height + y];
+                                             }
+
+                                             // Sort seam positions for this row (bubble sort is fine for small k)
+                                             for (int i = 0; i < k - 1; ++i) {
+                                                 for (int j = 0; j < k - i - 1; ++j) {
+                                                     if (seam_positions[j] > seam_positions[j + 1]) {
+                                                         int temp = seam_positions[j];
+                                                         seam_positions[j] = seam_positions[j + 1];
+                                                         seam_positions[j + 1] = temp;
+                                                     }
+                                                 }
+                                             }
+
+                                             int write_idx = 0;
+                                             int seam_idx = 0;
+
+                                             for (int x = 0; x < width; ++x) {
+                                                 // Copy original pixel
+                                                 newData[(y * new_width + write_idx) * 3 + 0] = oldData[(y * width + x) * 3 + 0];
+                                                 newData[(y * new_width + write_idx) * 3 + 1] = oldData[(y * width + x) * 3 + 1];
+                                                 newData[(y * new_width + write_idx) * 3 + 2] = oldData[(y * width + x) * 3 + 2];
+                                                 write_idx++;
+
+                                                 // Check if this is a seam position - if so, duplicate
+                                                 while (seam_idx < k && seam_positions[seam_idx] == x) {
+                                                     newData[(y * new_width + write_idx) * 3 + 0] = oldData[(y * width + x) * 3 + 0];
+                                                     newData[(y * new_width + write_idx) * 3 + 1] = oldData[(y * width + x) * 3 + 1];
+                                                     newData[(y * new_width + write_idx) * 3 + 2] = oldData[(y * width + x) * 3 + 2];
+                                                     write_idx++;
+                                                     seam_idx++;
+                                                 }
+                                             }
+                                         }
+
+                                         free(oldData);
+                                         image->lpData = newData;
+                                         image->width = new_width;
+
+                                         return image;
+                                     }
+
+                                     // OPTIMIZED: Single-pass seam carving
+                                     struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams) {
+                                         int height = image->height;
+                                         int width = image->width;
+
+                                         // PHASE 1: Calculate energy ONCE (on GPU)
+                                         printf("Phase 1: Calculating energy...\n");
+                                         unsigned int *pixelEnergies = calculateEnergySobel(image);
+                                         unsigned int *minEnergySums = calculateMinEnergySums(pixelEnergies, width, height);
+                                         free(pixelEnergies);
+
+                                         // PHASE 2: Find all seams at once (deterministic)
+                                         printf("Phase 2: Finding %d seams...\n", seams);
+                                         int *seamStartIndices = malloc(sizeof(int) * seams);
+                                         findAllSeams(minEnergySums, width, height, seams, seamStartIndices);
+
+                                         // PHASE 3: Trace all seams in parallel (on GPU)
+                                         printf("Phase 3: Tracing seams...\n");
+                                         int *seamPaths = malloc(sizeof(int) * seams * height);
+                                         traceAllSeams(minEnergySums, width, height, seams, seamStartIndices, seamPaths);
+
+                                         free(minEnergySums);
+                                         free(seamStartIndices);
+
+                                         // PHASE 4: Insert all seams at once (parallel per row)
+                                         printf("Phase 4: Inserting seams...\n");
+                                         insertAllSeams(image, seams, seamPaths);
+
+                                         free(seamPaths);
+
+                                         return image;
+                                     }
 
 
-int main(int argc, char *argv[]) {
-    if (argc < 4) {
-        printf("Usage: %s inputJPEG outputJPEG numSeams\n", argv[0]);
-        return 0;
-    }
-    char *inputFile = argv[1];
-    char *outputFile = argv[2];
-    int seams = atoi(argv[3]);
+                                     int main(int argc, char *argv[]) {
+                                         if (argc < 4) {
+                                             printf("Usage: %s inputJPEG outputJPEG numSeams\n", argv[0]);
+                                             return 0;
+                                         }
+                                         char *inputFile = argv[1];
+                                         char *outputFile = argv[2];
+                                         int seams = atoi(argv[3]);
 
-    struct imgRawImage *input = loadJpegImageFile(inputFile);
-    clock_t start = clock();
+                                         struct imgRawImage *input = loadJpegImageFile(inputFile);
+                                         clock_t start = clock();
 
-    input->lpData = gray(input);
-    struct imgRawImage *output = increaseWidth(input, seams);
+                                         input->lpData = gray(input);
+                                         struct imgRawImage *output = increaseWidth(input, seams);
 
-    clock_t end = clock();
-    printf("Execution time: %4.2f sec\n", (double) ((double) (end - start) / CLOCKS_PER_SEC));
-    storeJpegImageFile(output, outputFile);
+                                         clock_t end = clock();
+                                         printf("Execution time: %4.2f sec\n", (double) ((double) (end - start) / CLOCKS_PER_SEC));
+                                         storeJpegImageFile(output, outputFile);
 
-    return 0;
-}
+                                         return 0;
+                                     }
