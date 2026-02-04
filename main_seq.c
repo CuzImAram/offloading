@@ -16,6 +16,10 @@
 #define MIN(a, b) (((a)<(b))?(a):(b))
 #define MAX(a, b) (((a)>(b))?(a):(b))
 
+// Torus Macros for boundary wrapping
+#define TORUS_Y(y, height) (((y) + (height)) % (height))
+#define TORUS_X(x, width) (((x) + (width)) % (width))
+
 // Note: Since the gradient isn't normalized,
 // we rescale the summands in the entropy calculations slightly,
 #define entrop(p) (-1.0 * log2((p)) * (p) * (CHAR_MAX / 5.0 * 3.2))
@@ -82,31 +86,37 @@ void selectionSort(unsigned int arr[], int n) {
 }
 
 unsigned int *calculateEnergySobel(struct imgRawImage *image) {
-    //TODO implement Torus
     unsigned int width = image->width;
-    unsigned int *output = malloc(sizeof(unsigned int) * image->height * image->width);
+    unsigned int height = image->height;
+    unsigned int *output = malloc(sizeof(unsigned int) * height * width);
 
     int gx, gy, e_1, local_min, local_max, hist_width, e_entropy;
     double bins[9];
 
-    for (int y = 0; y < image->height; ++y) {
-        for (int x = 0; x < image->width; ++x) {
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            // Implement Torus lookup indices
+            int y_m1 = TORUS_Y(y - 1, height);
+            int y_p1 = TORUS_Y(y + 1, height);
+            int x_m1 = TORUS_X(x - 1, width);
+            int x_p1 = TORUS_X(x + 1, width);
+
             // Step 1: Compute edge-component
             // apply Sobel operator in X direction
-            gx = -1 * d3(y - 1, x - 1, 0)
-            + 1 * d3(y - 1, x + 1, 0)
-            - 2 * d3(y, x - 1, 0)
-            + 2 * d3(y, x + 1, 0)
-            - 1 * d3(y + 1, x - 1, 0)
-            + 1 * d3(y + 1, x + 1, 0);
+            gx = -1 * d3(y_m1, x_m1, 0)
+            + 1 * d3(y_m1, x_p1, 0)
+            - 2 * d3(y, x_m1, 0)
+            + 2 * d3(y, x_p1, 0)
+            - 1 * d3(y_p1, x_m1, 0)
+            + 1 * d3(y_p1, x_p1, 0);
 
             // apply Sobel operator in Y direction
-            gy = -1 * d3(y - 1, x - 1, 0)
-            - 2 * d3(y - 1, x, 0)
-            - 1 * d3(y - 1, x + 1, 0)
-            + 1 * d3(y + 1, x - 1, 0)
-            + 2 * d3(y + 1, x, 0)
-            + 1 * d3(y + 1, x + 1, 0);
+            gy = -1 * d3(y_m1, x_m1, 0)
+            - 2 * d3(y_m1, x, 0)
+            - 1 * d3(y_m1, x_p1, 0)
+            + 1 * d3(y_p1, x_m1, 0)
+            + 2 * d3(y_p1, x, 0)
+            + 1 * d3(y_p1, x_p1, 0);
 
             e_1 = (int) (abs(gx) + abs(gy));
 
@@ -119,19 +129,23 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image) {
             local_max = INT_MIN;
             e_entropy = 0;
 
-            // find min/max for local histogram
+            // find min/max for local histogram with Torus wrapping
             for (int v = -4; v < 4; ++v) {
                 for (int u = -4; u < 4; ++u) {
-                    local_min = MIN(local_min, d3(y + v, x + u, 0));
-                    local_max = MAX(local_max, d3(y + v, x + u, 0));
+                    int y_idx = TORUS_Y(y + v, height);
+                    int x_idx = TORUS_X(x + u, width);
+                    local_min = MIN(local_min, d3(y_idx, x_idx, 0));
+                    local_max = MAX(local_max, d3(y_idx, x_idx, 0));
                 }
             }
             hist_width = local_max - local_min + 1;
 
-            // compute local histogram
+            // compute local histogram with Torus wrapping
             for (int v = -4; v < 4; ++v) {
                 for (int u = -4; u < 4; ++u) {
-                    int i = (d3(y + v, x + u, 0) - local_min) * 9 / hist_width;
+                    int y_idx = TORUS_Y(y + v, height);
+                    int x_idx = TORUS_X(x + u, width);
+                    int i = (d3(y_idx, x_idx, 0) - local_min) * 9 / hist_width;
                     bins[i] += 1.0;
                 }
             }
