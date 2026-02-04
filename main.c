@@ -3,6 +3,7 @@
 #include <math.h>
 #include <time.h>
 #include <limits.h>
+#include <omp.h>
 #include "image.h"
 
 #define d3(y, x, z) image->lpData[(y)*image->width*3+(x)*3+(z)]
@@ -15,26 +16,37 @@
 #define nw(y, x) newMinEnergySums[(y)*(width+1)+(x)]
 #define MIN(a, b) (((a)<(b))?(a):(b))
 #define MAX(a, b) (((a)>(b))?(a):(b))
+#define ABS(x) (((x)<0)?-(x):(x))
 
 // Note: Since the gradient isn't normalized,
 // we rescale the summands in the entropy calculations slightly,
 #define entrop(p) (-1.0 * log2((p)) * (p) * (CHAR_MAX / 5.0 * 3.2))
 
+// Torus indexing for safe boundary access
+#define TORUS_Y(y, height) (((y) + (height)) % (height))
+#define TORUS_X(x, width) (((x) + (width)) % (width))
+
 
 unsigned char *gray(struct imgRawImage *image) {
     unsigned int width = image->width;
     unsigned int height = image->height;
-    unsigned char *output = malloc(sizeof(unsigned char) * 3 * (width) * height);
+    unsigned char *output = malloc(sizeof(unsigned char) * 3 * width * height);
+    unsigned char *input = image->lpData;
 
-    for (int y = 0; y < image->height; ++y) {
-        for (int x = 0; x < image->width; ++x) {
+    // GPU offloading for gray conversion - fully parallel
+    #pragma omp target teams distribute parallel for collapse(2) \
+    map(to: input[0:width*height*3]) \
+    map(from: output[0:width*height*3])
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int idx = y * width * 3 + x * 3;
             unsigned char luma = (unsigned char) (
-                0.299f * (float) d3(y, x, 0)
-                + 0.587f * (float) d3(y, x, 1)
-                + 0.114f * (float) d3(y, x, 2));
-            o3(y, x, 0) = luma;
-            o3(y, x, 1) = luma;
-            o3(y, x, 2) = luma;
+                0.299f * (float) input[idx + 0]
+                + 0.587f * (float) input[idx + 1]
+                + 0.114f * (float) input[idx + 2]);
+            output[idx + 0] = luma;
+            output[idx + 1] = luma;
+            output[idx + 2] = luma;
         }
     }
     return output;
@@ -42,20 +54,40 @@ unsigned char *gray(struct imgRawImage *image) {
 
 unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height) {
     unsigned int *output = malloc(sizeof(unsigned int) * width * height);
+
+    // First row initialization - parallel
+    #pragma omp target teams distribute parallel for \
+    map(to: data[0:width*height]) \
+    map(from: output[0:width*height])
     for (int x = 0; x < width; ++x) {
-        o(0, x) = d1(0, x);
+        output[x] = data[x];
     }
-    for (int y = 1; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            if (x == width - 1) { // rightmost pixel of a row
-                o(y, x) = d1(y, x) + MIN(o(y - 1, x - 1), o(y - 1, x));
-            } else if (x == 0) { // leftmost pixel of a row
-                o(y, x) = d1(y, x) + MIN(o(y - 1, x), o(y - 1, x + 1));
-            } else {
-                o(y, x) = d1(y, x) + MIN(MIN(o(y - 1, x - 1), o(y - 1, x)), o(y - 1, x + 1));
+
+    // Subsequent rows - must be sequential in y, but parallel in x
+    // Each row depends on previous row, so we do row-by-row on GPU
+    #pragma omp target data map(to: data[0:width*height]) \
+    map(tofrom: output[0:width*height])
+    {
+        for (int y = 1; y < height; ++y) {
+            #pragma omp target teams distribute parallel for
+            for (int x = 0; x < width; ++x) {
+                unsigned int min_val;
+                int idx = y * width + x;
+                int idx_prev = (y - 1) * width + x;
+
+                if (x == width - 1) { // rightmost pixel
+                    min_val = MIN(output[idx_prev - 1], output[idx_prev]);
+                } else if (x == 0) { // leftmost pixel
+                    min_val = MIN(output[idx_prev], output[idx_prev + 1]);
+                } else { // middle pixels
+                    min_val = MIN(MIN(output[idx_prev - 1], output[idx_prev]),
+                                  output[idx_prev + 1]);
+                }
+                output[idx] = data[idx] + min_val;
             }
         }
     }
+
     return output;
 }
 
@@ -68,50 +100,56 @@ void swap(unsigned int *xp, unsigned int *yp) {
 void selectionSort(unsigned int arr[], int n) {
     int i, j, max_idx;
 
-    // One by one move boundary of unsorted subarray
     for (i = 0; i < n - 1; i++) {
-        // Find the maximum element in unsorted array
         max_idx = i;
         for (j = i + 1; j < n; j++)
             if (arr[j] > arr[max_idx])
                 max_idx = j;
-
-        // Swap the found minimum element with the first element
         swap(&arr[max_idx], &arr[i]);
     }
 }
 
 unsigned int *calculateEnergySobel(struct imgRawImage *image) {
-    //TODO implement Torus
     unsigned int width = image->width;
-    unsigned int *output = malloc(sizeof(unsigned int) * image->height * image->width);
+    unsigned int height = image->height;
+    unsigned int *output = malloc(sizeof(unsigned int) * height * width);
+    unsigned char *input = image->lpData;
 
-    int gx, gy, e_1, local_min, local_max, hist_width, e_entropy;
-    double bins[9];
+    // GPU offloading for energy calculation
+    // This is the most computationally intensive part
+    #pragma omp target teams distribute parallel for collapse(2) \
+    map(to: input[0:width*height*3]) \
+    map(from: output[0:width*height])
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int gx, gy, e_1, local_min, local_max, hist_width, e_entropy;
+            double bins[9];
 
-    for (int y = 0; y < image->height; ++y) {
-        for (int x = 0; x < image->width; ++x) {
-            // Step 1: Compute edge-component
+            // Step 1: Compute edge-component using Torus indexing
             // apply Sobel operator in X direction
-            gx = -1 * d3(y - 1, x - 1, 0)
-            + 1 * d3(y - 1, x + 1, 0)
-            - 2 * d3(y, x - 1, 0)
-            + 2 * d3(y, x + 1, 0)
-            - 1 * d3(y + 1, x - 1, 0)
-            + 1 * d3(y + 1, x + 1, 0);
+            int y_m1 = TORUS_Y(y - 1, height);
+            int y_p1 = TORUS_Y(y + 1, height);
+            int x_m1 = TORUS_X(x - 1, width);
+            int x_p1 = TORUS_X(x + 1, width);
+
+            gx = -1 * input[(y_m1 * width + x_m1) * 3 + 0]
+            + 1 * input[(y_m1 * width + x_p1) * 3 + 0]
+            - 2 * input[(y * width + x_m1) * 3 + 0]
+            + 2 * input[(y * width + x_p1) * 3 + 0]
+            - 1 * input[(y_p1 * width + x_m1) * 3 + 0]
+            + 1 * input[(y_p1 * width + x_p1) * 3 + 0];
 
             // apply Sobel operator in Y direction
-            gy = -1 * d3(y - 1, x - 1, 0)
-            - 2 * d3(y - 1, x, 0)
-            - 1 * d3(y - 1, x + 1, 0)
-            + 1 * d3(y + 1, x - 1, 0)
-            + 2 * d3(y + 1, x, 0)
-            + 1 * d3(y + 1, x + 1, 0);
+            gy = -1 * input[(y_m1 * width + x_m1) * 3 + 0]
+            - 2 * input[(y_m1 * width + x) * 3 + 0]
+            - 1 * input[(y_m1 * width + x_p1) * 3 + 0]
+            + 1 * input[(y_p1 * width + x_m1) * 3 + 0]
+            + 2 * input[(y_p1 * width + x) * 3 + 0]
+            + 1 * input[(y_p1 * width + x_p1) * 3 + 0];
 
-            e_1 = (int) (abs(gx) + abs(gy));
+            e_1 = ABS(gx) + ABS(gy);
 
-            // Step 2: Compute entropy-component
-            // clear out bins and reset variables
+            // Step 2: Compute entropy-component with Torus indexing
             for (int i = 0; i < 9; ++i) {
                 bins[i] = 0;
             }
@@ -119,11 +157,14 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image) {
             local_max = INT_MIN;
             e_entropy = 0;
 
-            // find min/max for local histogram
+            // find min/max for local histogram (8x8 neighborhood)
             for (int v = -4; v < 4; ++v) {
                 for (int u = -4; u < 4; ++u) {
-                    local_min = MIN(local_min, d3(y + v, x + u, 0));
-                    local_max = MAX(local_max, d3(y + v, x + u, 0));
+                    int y_idx = TORUS_Y(y + v, height);
+                    int x_idx = TORUS_X(x + u, width);
+                    int pixel_val = input[(y_idx * width + x_idx) * 3 + 0];
+                    local_min = MIN(local_min, pixel_val);
+                    local_max = MAX(local_max, pixel_val);
                 }
             }
             hist_width = local_max - local_min + 1;
@@ -131,27 +172,30 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image) {
             // compute local histogram
             for (int v = -4; v < 4; ++v) {
                 for (int u = -4; u < 4; ++u) {
-                    int i = (d3(y + v, x + u, 0) - local_min) * 9 / hist_width;
+                    int y_idx = TORUS_Y(y + v, height);
+                    int x_idx = TORUS_X(x + u, width);
+                    int pixel_val = input[(y_idx * width + x_idx) * 3 + 0];
+                    int i = (pixel_val - local_min) * 9 / hist_width;
                     bins[i] += 1.0;
                 }
             }
 
             // compute entropy
             for (int i = 0; i < 9; ++i) {
-                bins[i] /= 81.0; // Normalize the counter to turn it into a probability
+                bins[i] /= 81.0;
                 if (bins[i] > 0.0) {
                     e_entropy += (int) entrop(bins[i]);
                 }
             }
 
             // Step 3: assign energy value
-            o(y, x) = e_1 + e_entropy;
+            output[y * width + x] = e_1 + e_entropy;
         }
     }
     return output;
 }
 
-// increases the number of columns by cols
+// increases the number of columns by seams
 struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams) {
     int height = image->height;
     unsigned int *newMinEnergySums;
@@ -175,7 +219,7 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams) {
                     break;
                 }
             }
-            if (skip == 1) { // index is already a minimum
+            if (skip == 1) {
                 continue;
             }
             if (mins[k] == width || m1(height - 1, j) < m1(height - 1, mins[k])) {
@@ -192,12 +236,11 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams) {
 
     selectionSort(mins, seams);
 
+    // Seam insertion remains on CPU - too complex for efficient GPU parallelization
     for (int i = 0; i < seams; ++i) {
         unsigned int minIdx = mins[i];
-        // each iteration increases the width by 1
         int width = image->width;
         unsigned char *oldData = image->lpData;
-        // printf("iteration %i with width=%i and minIdx=%d\n", i, width, minIdx);
         newMinEnergySums = malloc(sizeof(unsigned int) * (width + 1) * height);
         newData = malloc(sizeof(unsigned char) * 3 * (width + 1) * height);
 
@@ -212,13 +255,14 @@ struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams) {
         nd3(height - 1, minIdx + 1, 0) = od3(height - 1, minIdx, 0);
         nd3(height - 1, minIdx + 1, 1) = od3(height - 1, minIdx, 1);
         nd3(height - 1, minIdx + 1, 2) = od3(height - 1, minIdx, 2);
-        // move all pixels right of the seam 1 to the right
+
         for (int j = minIdx + 1; j < width; ++j) {
             nw(height - 1, j + 1) = m1(height - 1, j);
             nd3(height - 1, j + 1, 0) = od3(height - 1, j, 0);
             nd3(height - 1, j + 1, 1) = od3(height - 1, j, 1);
             nd3(height - 1, j + 1, 2) = od3(height - 1, j, 2);
         }
+
         int x = minIdx;
         for (int y = height - 2; y >= 0; --y) {
             unsigned int min;
