@@ -165,7 +165,7 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image)
     return output;
 }
 
-// OPTIMIZED: Find all k seams at once (deterministic)
+// Find all k seams at once (deterministic)
 void findAllSeams(unsigned int *minEnergySums, int width, int height,
                   int k, int *seamStartIndices)
 {
@@ -217,7 +217,7 @@ void findAllSeams(unsigned int *minEnergySums, int width, int height,
     }
 }
 
-// OPTIMIZED: Trace all seams in parallel on GPU
+// Trace all seams in parallel on GPU
 void traceAllSeams(unsigned int *minEnergySums, int width, int height,
                    int k, int *seamStartIndices, int *seamPaths)
 {
@@ -272,7 +272,7 @@ void traceAllSeams(unsigned int *minEnergySums, int width, int height,
     }
 }
 
-// OPTIMIZED: Insert all seams at once (parallel per row)
+// Insert all seams at once (parallel per row)
 struct imgRawImage *insertAllSeams(struct imgRawImage *image, int k, int *seamPaths)
 {
     int height = image->height;
@@ -338,7 +338,7 @@ struct imgRawImage *insertAllSeams(struct imgRawImage *image, int k, int *seamPa
     return image;
 }
 
-// OPTIMIZED: Single-pass seam carving
+// Single-pass seam carving
 struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
 {
     int height = image->height;
