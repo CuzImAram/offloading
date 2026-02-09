@@ -4,166 +4,180 @@ import random
 class SeamCarvingVisualizer:
     def __init__(self, root):
         self.root = root
-        self.root.title("Seam Carving Offloading Visualization")
+        self.root.title("Seam Carving Offloading (Fixed Steps)")
+        self.root.geometry("1100x750")
         
         # Grid Setup
         self.width = 10
         self.height = 8
         self.cell_size = 50
         
-        # Initialisiere Pixel
+        # Initialdaten
         self.pixels = [[random.randint(50, 200) for _ in range(self.width)] for _ in range(self.height)]
-        
-        # Diese Matrizen werden jetzt dynamisch in den Funktionen erstellt
         self.energy = []
         self.cum_energy = []
-        
-        self.state = "START" 
         self.seam = []
+        self.seam_start_x = -1
+        self.current_pass = 1
 
-        # UI Setup
-        self.header = tk.Label(root, text="Seam Carving: Initial Image", font=("Arial", 14, "bold"))
-        self.header.pack(pady=10)
+        # State Mapping basierend auf enlarge.c
+        # 1: calculateEnergySobel, 2: calculateMinEnergySums, 3: traceAllSeams, 4: insertAllSeams
+        self.step_num = 1 
+        self.state = "START" 
+
+        # --- UI SETUP ---
+        self.header = tk.Label(root, text=f"PASS {self.current_pass}", font=("Arial", 16, "bold"))
+        self.header.pack(pady=5)
+
+        # Hardware & Step Log
+        self.log_frame = tk.Frame(root, bg="#2c3e50", padx=10, pady=8)
+        self.log_frame.pack(fill=tk.X, padx=10)
         
-        self.canvas = tk.Canvas(root, width=800, height=500, bg="white")
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.step_label = tk.Label(self.log_frame, text="Step 1", fg="#f1c40f", bg="#2c3e50", font=("Consolas", 14, "bold"))
+        self.step_label.pack(side=tk.LEFT)
         
-        self.info = tk.Label(root, text="Klicke 'Next Step' um die Energy Map zu berechnen", font=("Arial", 10))
-        self.info.pack(pady=5)
+        self.hw_label = tk.Label(self.log_frame, text="HW: GPU", fg="#e74c3c", bg="#2c3e50", font=("Consolas", 12, "bold"))
+        self.hw_label.pack(side=tk.LEFT, padx=20)
         
-        self.btn = tk.Button(root, text="Next Step", command=self.next_step, bg="#2c3e50", fg="white", font=("Arial", 10, "bold"), width=20)
-        self.btn.pack(pady=10)
+        self.meaning_label = tk.Label(self.log_frame, text="Zahlen = Graustufen (0-255)", fg="#bdc3c7", bg="#2c3e50", font=("Arial", 10, "italic"))
+        self.meaning_label.pack(side=tk.RIGHT)
+
+        self.canvas = tk.Canvas(root, bg="white", highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        self.info = tk.Label(root, text="Bereit für Energieberechnung (Sobel)", font=("Arial", 11))
+        self.info.pack()
+
+        self.btn = tk.Button(root, text="Nächster Schritt", command=self.next_step, bg="#34495e", fg="white", font=("Arial", 12, "bold"), height=2)
+        self.btn.pack(fill=tk.X, padx=20, pady=15)
         
         self.draw_grid()
+
+    def update_ui_text(self, step, hw, task, meaning, color="#3498db"):
+        self.step_label.config(text=f"Step {step}")
+        self.hw_label.config(text=f"HW: {hw}", fg="#e74c3c" if hw=="GPU" else "#f1c40f")
+        self.meaning_label.config(text=f"Bedeutung: {meaning}")
+        self.info.config(text=task, fg=color)
+        self.header.config(text=f"PASS {self.current_pass}")
 
     def draw_grid(self, seam_line=None):
         self.canvas.delete("all")
         current_w = len(self.pixels[0])
         
+        # Dynamische Zellengröße bei Fullscreen/vielen Klicks
+        display_w = self.canvas.winfo_width()
+        if display_w > 100:
+            self.cell_size = min(60, (display_w - 100) / current_w)
+
         for y in range(self.height):
             for x in range(current_w):
                 val = self.pixels[y][x]
-                x0, y0 = x * self.cell_size + 20, y * self.cell_size + 20
+                x0, y0 = x * self.cell_size + 40, y * self.cell_size + 40
                 x1, y1 = x0 + self.cell_size, y0 + self.cell_size
                 
-                # Farblogik basierend auf Phase
+                # Farblogik
                 if self.state == "ENERGY" and self.energy:
                     e_val = self.energy[y][x]
-                    e_norm = min(e_val * 2, 255)
-                    color = f"#{e_norm:02x}0000"
-                    disp_val = e_val
+                    color = f"#{min(e_val*4, 255):02x}0000"
+                    disp = e_val
                 elif self.state == "CUMULATIVE" and self.cum_energy:
                     ce_val = self.cum_energy[y][x]
-                    ce_norm = min(int(ce_val / 5), 255)
-                    color = f"#{ce_norm:02x}{ce_norm:02x}ff"
-                    disp_val = ce_val
+                    color = f"#{min(int(ce_val/4), 255):02x}{min(int(ce_val/4), 255):02x}ff"
+                    disp = ce_val
                 else:
                     color = f"#{val:02x}{val:02x}{val:02x}"
-                    disp_val = val
+                    disp = val
                 
-                self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="gray")
-                # Wert nur anzeigen wenn Zellen groß genug sind
-                if current_w < 15:
-                    text_col = "green" if (self.state == "START" and val > 150) else "white"
-                    self.canvas.create_text(x0+25, y0+25, text=str(disp_val), fill=text_col, font=("Arial", 8))
+                outline = "cyan" if (self.state == "FIND_START" and y == self.height-1 and x == self.seam_start_x) else "#444"
+                self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline=outline, width=1)
+                
+                # Zahlen fix: Jetzt bis zu einer Breite von 40 Spalten sichtbar
+                if current_w < 40:
+                    font_size = int(self.cell_size / 4)
+                    self.canvas.create_text(x0+self.cell_size/2, y0+self.cell_size/2, 
+                                            text=str(disp), fill="white", font=("Arial", font_size))
 
         if seam_line:
             for i in range(len(seam_line)-1):
                 p1, p2 = seam_line[i], seam_line[i+1]
-                self.canvas.create_line(p1[0]*self.cell_size+45, p1[1]*self.cell_size+45, 
-                                         p2[0]*self.cell_size+45, p2[1]*self.cell_size+45, 
-                                         fill="red", width=4)
+                self.canvas.create_line(p1[0]*self.cell_size+40+self.cell_size/2, p1[1]*self.cell_size+40+self.cell_size/2, 
+                                         p2[0]*self.cell_size+40+self.cell_size/2, p2[1]*self.cell_size+40+self.cell_size/2, 
+                                         fill="#e74c3c", width=3)
 
     def next_step(self):
         if self.state == "START":
             self.calc_energy()
             self.state = "ENERGY"
-            self.header.config(text="Phase 1: Energy Map (Sobel)")
-            self.info.config(text="Berechnung der Kantenstärke (Gradienten).")
+            self.step_num = 1
+            self.update_ui_text(1, "GPU", "calculateEnergySobel (Offloading)", "Kantenstärke/Gradienten")
         
         elif self.state == "ENERGY":
             self.calc_cumulative()
             self.state = "CUMULATIVE"
-            self.header.config(text="Phase 2: Accumulated Energy")
-            self.info.config(text="Dynamic Programming: Akkumulierte Kosten von oben nach unten.")
+            self.step_num = 2
+            self.update_ui_text(2, "GPU", "calculateMinEnergySums (DP)", "Kumulative Kosten")
             
         elif self.state == "CUMULATIVE":
-            self.trace_seam()
+            self.find_seam_start()
+            self.state = "FIND_START"
+            self.step_num = 3
+            self.update_ui_text(3, "CPU", "findAllSeams & qsort", "Kumulative Kosten (Startpunkt-Suche)")
+            
+        elif self.state == "FIND_START":
+            self.trace_seam_path()
             self.state = "TRACING"
-            self.header.config(text="Phase 3: Seam Tracing")
-            self.info.config(text="Backtracking: Der Pfad mit der geringsten Energie wurde gefunden.")
+            self.step_num = 3 # Gehört im C-Code zum selben Block (Finding/Tracing)
+            self.update_ui_text(3, "GPU", "traceAllSeams (Backtracking)", "Kumulative Kosten (Pfad)")
             
         elif self.state == "TRACING":
             self.enlarge_image()
             self.state = "START"
-            self.header.config(text="Phase 4: Image Enlarged")
-            self.info.config(text="Ein Seam wurde eingefügt. Bildbreite erhöht.")
+            self.step_num = 4
+            self.update_ui_text(4, "GPU", "insertAllSeams (Resizing)", "Graustufen (Neuer Pixel eingefügt)")
+            self.current_pass += 1
             
         self.draw_grid(seam_line=self.seam if self.state in ["TRACING", "START"] else None)
 
+    # ... (Methoden calc_energy, calc_cumulative, find_seam_start, trace_seam_path, enlarge_image identisch zum Vorherigen) ...
     def calc_energy(self):
-        """ Entspricht calculateEnergySobel in enlarge.c """
-        current_w = len(self.pixels[0])
-        # WICHTIG: Matrix auf aktuelle Breite initialisieren
-        self.energy = [[0 for _ in range(current_w)] for _ in range(self.height)]
-        
+        w = len(self.pixels[0])
+        self.energy = [[0 for _ in range(w)] for _ in range(self.height)]
         for y in range(self.height):
-            for x in range(current_w):
-                # Gradientenberechnung (vereinfacht)
-                dx = abs(self.pixels[y][(x+1)%current_w] - self.pixels[y][x-1])
+            for x in range(w):
+                dx = abs(self.pixels[y][(x+1)%w] - self.pixels[y][x-1])
                 dy = abs(self.pixels[(y+1)%self.height][x] - self.pixels[y-1][x])
                 self.energy[y][x] = dx + dy
 
     def calc_cumulative(self):
-        """ Entspricht calculateMinEnergySums in enlarge.c """
-        current_w = len(self.pixels[0])
-        self.cum_energy = [[0 for _ in range(current_w)] for _ in range(self.height)]
-        
-        for x in range(current_w):
-            self.cum_energy[0][x] = self.energy[0][x]
-        
+        w = len(self.pixels[0])
+        self.cum_energy = [[0 for _ in range(w)] for _ in range(self.height)]
+        for x in range(w): self.cum_energy[0][x] = self.energy[0][x]
         for y in range(1, self.height):
-            for x in range(current_w):
-                # Suche Minimum der 3 oberen Nachbarn
-                prev_options = []
-                for dx in [-1, 0, 1]:
-                    if 0 <= x+dx < current_w:
-                        prev_options.append(self.cum_energy[y-1][x+dx])
-                self.cum_energy[y][x] = self.energy[y][x] + min(prev_options)
+            for x in range(w):
+                prev = [self.cum_energy[y-1][px] for px in [x-1, x, x+1] if 0 <= px < w]
+                self.cum_energy[y][x] = self.energy[y][x] + min(prev)
 
-    def trace_seam(self):
-        """ Entspricht traceAllSeams in enlarge.c """
-        current_w = len(self.pixels[0])
-        self.seam = []
-        # Start am Minimum der letzten Zeile
+    def find_seam_start(self):
         last_row = self.cum_energy[self.height-1]
-        curr_x = last_row.index(min(last_row))
-        self.seam.append((curr_x, self.height-1))
-        
+        self.seam_start_x = last_row.index(min(last_row))
+
+    def trace_seam_path(self):
+        w = len(self.pixels[0])
+        self.seam = [(self.seam_start_x, self.height-1)]
+        curr_x = self.seam_start_x
         for y in range(self.height-2, -1, -1):
-            possible_x = [curr_x-1, curr_x, curr_x+1]
-            best_x = curr_x
-            min_val = float('inf')
-            for px in possible_x:
-                if 0 <= px < current_w and self.cum_energy[y][px] < min_val:
-                    min_val = self.cum_energy[y][px]
-                    best_x = px
-            curr_x = best_x
+            opts = [px for px in [curr_x-1, curr_x, curr_x+1] if 0 <= px < w]
+            curr_x = min(opts, key=lambda x: self.cum_energy[y][x])
             self.seam.append((curr_x, y))
 
     def enlarge_image(self):
-        """ Entspricht insertAllSeams in enlarge.c """
         new_pixels = []
         for y in range(self.height):
             row = list(self.pixels[y])
-            # Finde x-Koordinate des Seams in dieser Zeile
-            seam_x = [p[0] for p in self.seam if p[1] == y][0]
-            # Pixel duplizieren (Offloading Logik: Bild vergrößern)
-            row.insert(seam_x, row[seam_x])
+            sx = [p[0] for p in self.seam if p[1] == y][0]
+            row.insert(sx, row[sx])
             new_pixels.append(row)
-        
         self.pixels = new_pixels
-        self.seam = [] # Reset Seam für nächsten Durchlauf
 
 if __name__ == "__main__":
     root = tk.Tk()
