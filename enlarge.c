@@ -13,6 +13,7 @@
 #define CLAMP(val, min, max) ((val) < (min) ? (min) : ((val) > (max) ? (max) : (val)))
 
 // Pre-compute Entropy LUT (CPU)
+// Einmalige Berechnung auf CPU, da Tabelle sehr klein. Transfer lohnt nicht.
 int *create_entropy_lut()
 {
     int *lut = malloc(sizeof(int) * 82);
@@ -41,6 +42,9 @@ unsigned char *gray(struct imgRawImage *image)
     unsigned char *output = malloc(sizeof(unsigned char) * 3 * width * height);
     unsigned char *pixels = image->lpData;
 
+// Strategie: Massive Parallelität.
+// 'collapse(2)' verschmilzt Schleifen für maximale Auslastung der GPU-Kerne.
+// Daten werden explizit gemappt (Pixel -> GPU, Output -> Host).
 #pragma omp target teams distribute parallel for collapse(2) map(to : pixels[0 : 3 * width * height]) map(from : output[0 : 3 * width * height])
     for (int y = 0; y < height; ++y)
     {
@@ -51,7 +55,6 @@ unsigned char *gray(struct imgRawImage *image)
             unsigned char g = pixels[idx + 1];
             unsigned char b = pixels[idx + 2];
 
-            // Integer math for deterministic results across all platforms
             unsigned char luma = (r * 299 + g * 587 + b * 114) / 1000;
 
             output[idx + 0] = luma;
@@ -66,14 +69,20 @@ unsigned int *calculateMinEnergySums(unsigned int *data, int width, int height)
 {
     unsigned int *output = malloc(sizeof(unsigned int) * width * height);
 
+// Initialisierung der ersten Zeile parallel auf GPU
 #pragma omp target teams distribute parallel for map(to : data[0 : width * height]) map(from : output[0 : width * height])
     for (int x = 0; x < width; ++x)
         output[x] = data[x];
 
+// Strategie: Sequentielle Zeilenabhängigkeit (Dynamic Programming).
+// 'target data': Hält 'output' und 'data' persistent im GPU-Speicher.
+// Verhindert teures Kopieren zwischen den Iterationen der äußeren Schleife.
 #pragma omp target data map(to : data[0 : width * height]) map(tofrom : output[0 : width * height])
     {
+        // Äußere Schleife (y) läuft auf CPU zur Steuerung (wegen Abhängigkeit y-1).
         for (int y = 1; y < height; ++y)
         {
+// Innere Schleife (x) wird pro Zeile auf GPU offloaded.
 #pragma omp target teams distribute parallel for
             for (int x = 0; x < width; ++x)
             {
@@ -99,6 +108,9 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image, int *entropy_lut)
     unsigned int *output = malloc(sizeof(unsigned int) * height * width);
     unsigned char *pixels = image->lpData;
 
+// Strategie: Unabhängige Pixel-Operation.
+// LUT wird auf GPU gemappt für schnellen Zugriff.
+// 'collapse(2)' für maximale Thread-Anzahl.
 #pragma omp target teams distribute parallel for collapse(2)      \
     map(to : pixels[0 : 3 * width * height], entropy_lut[0 : 82]) \
     map(from : output[0 : width * height])
@@ -153,6 +165,9 @@ unsigned int *calculateEnergySobel(struct imgRawImage *image, int *entropy_lut)
     return output;
 }
 
+// Strategie: Ausführung auf CPU.
+// Algorithmus (finden der k kleinsten Werte in einer Reihe unter Berücksichtigung von Ausschlüssen)
+// ist stark sequentiell und lohnt den GPU-Overhead nicht.
 void findAllSeams(unsigned int *minEnergySums, int width, int height, int k, int *seamStartIndices)
 {
     for (int seam_id = 0; seam_id < k; ++seam_id)
@@ -189,6 +204,9 @@ void findAllSeams(unsigned int *minEnergySums, int width, int height, int k, int
 
 void traceAllSeams(unsigned int *minEnergySums, int width, int height, int k, int *seamStartIndices, int *seamPaths)
 {
+// Strategie: Parallelisierung über die Anzahl der Seams (k).
+// Jeder Thread berechnet einen kompletten Pfad (Bottom-Up).
+// Read-Only Zugriff auf minEnergySums ermöglicht konfliktfreie Parallelisierung.
 #pragma omp target teams distribute parallel for map(to : minEnergySums[0 : width * height], seamStartIndices[0 : k]) map(from : seamPaths[0 : k * height])
     for (int seam_id = 0; seam_id < k; ++seam_id)
     {
@@ -238,10 +256,13 @@ struct imgRawImage *insertAllSeams(struct imgRawImage *image, int k, int *seamPa
     unsigned char *newData = malloc(sizeof(unsigned char) * 3 * new_width * height);
     unsigned char *oldData = image->lpData;
 
+// Strategie: Parallelisierung über Zeilen (y).
+// Lokales Array 'seam_positions' pro Thread vermeidet Race Conditions.
+// Lokales Sortieren der Positionen notwendig für korrekte Einfügereihenfolge.
 #pragma omp target teams distribute parallel for map(to : oldData[0 : width * height * 3], seamPaths[0 : k * height]) map(from : newData[0 : new_width * height * 3])
     for (int y = 0; y < height; ++y)
     {
-        int seam_positions[4096];
+        int seam_positions[4096]; // Begrenzter Stack-Speicher auf GPU beachten
         int load_k = (k < 4096) ? k : 4096;
         for (int s = 0; s < load_k; ++s)
             seam_positions[s] = seamPaths[s * height + y];
@@ -282,16 +303,21 @@ struct imgRawImage *insertAllSeams(struct imgRawImage *image, int k, int *seamPa
 struct imgRawImage *increaseWidth(struct imgRawImage *image, int seams)
 {
     int *entropy_lut = create_entropy_lut();
+    // Datenfluss: Ergebnisse werden zwischen Schritten zur CPU zurückgeholt,
+    // um an die nächste Funktion übergeben zu werden.
     unsigned int *pixelEnergies = calculateEnergySobel(image, entropy_lut);
     free(entropy_lut);
     unsigned int *minEnergySums = calculateMinEnergySums(pixelEnergies, image->width, image->height);
     free(pixelEnergies);
     int *seamStartIndices = malloc(sizeof(int) * seams);
+
     findAllSeams(minEnergySums, image->width, image->height, seams, seamStartIndices);
     int *seamPaths = malloc(sizeof(int) * seams * image->height);
+
     traceAllSeams(minEnergySums, image->width, image->height, seams, seamStartIndices, seamPaths);
     free(minEnergySums);
     free(seamStartIndices);
+
     insertAllSeams(image, seams, seamPaths);
     free(seamPaths);
     return image;
